@@ -1,26 +1,103 @@
+#![allow(dead_code)]
+
 use std::io::stdin;
 
 use winnow::{
     Result as PResult,
     ascii::alpha1,
-    combinator::{alt, opt, seq, terminated},
+    combinator::{opt, seq},
     prelude::*,
-    token::{literal, take_till, take_until},
+    token::{literal, one_of, take_while},
 };
 
-fn parse_scheme<'a>(x: &mut &'a str) -> PResult<&'a str> {
-    fn default_scheme<'a>(x: &mut &'a str) -> PResult<&'a str> {
-        let scheme = alpha1.parse_next(x)?;
-        let _ = literal("://").parse_next(x)?;
-        Ok(scheme)
-    }
+fn parse_scheme(x: &mut &str) -> PResult<String> {
+    let first_char = one_of(('a'..='z', 'A'..='Z')).parse_next(x)?;
 
-    alt((default_scheme, terminated("mailto", ":"))).parse_next(x)
+    let rest = take_while(1.., ('a'..='z', 'A'..='Z', '0'..='9', '+', '-', '.')).parse_next(x)?;
+
+    let mut s = String::with_capacity(rest.len() + 1);
+    s.push(first_char);
+    s.push_str(rest);
+
+    Ok(s)
 }
 
-fn parse_authority<'a>(x: &mut &'a str) -> PResult<&'a str> {
+mod authority {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use winnow::{
+        ascii::{dec_uint, hex_uint}, combinator::{alt, delimited, not, opt, repeat, terminated}, error::{StrContext::Expected, StrContextValue::Description}, prelude::*, token::{any, take_until}, ModalResult as PResult
+    };
 
-    todo!()
+    pub fn parse_ipv4(x: &mut &str) -> PResult<Ipv4Addr> {
+        let ip = (
+            terminated(dec_uint::<_, u8, _>, '.'),
+            terminated(dec_uint::<_, u8, _>, '.'),
+            terminated(dec_uint::<_, u8, _>, '.'),
+            dec_uint::<_, u8, _>,
+        )
+            .context(Expected(Description("ipv4")))
+            .parse_next(x)?;
+
+        Ok(Ipv4Addr::new(ip.0, ip.1, ip.2, ip.3))
+    }
+
+    pub fn parse_ipv6(x: &mut &str) -> PResult<Ipv6Addr> {
+        let ip = (
+            terminated(hex_uint::<_, u16, _>, ':'),
+            terminated(hex_uint::<_, u16, _>, ':'),
+            terminated(hex_uint::<_, u16, _>, ':'),
+            terminated(hex_uint::<_, u16, _>, ':'),
+            terminated(hex_uint::<_, u16, _>, ':'),
+            terminated(hex_uint::<_, u16, _>, ':'),
+            terminated(hex_uint::<_, u16, _>, ':'),
+            hex_uint::<_, u16, _>,
+        )
+            .context(Expected(Description("ipv6")))
+            .parse_next(x)?;
+
+        Ok(Ipv6Addr::new(
+            ip.0, ip.1, ip.2, ip.3, ip.4, ip.5, ip.6, ip.7,
+        ))
+    }
+
+    pub fn parse_authority<'a>(x: &mut &'a str) -> PResult<&'a str> {
+        fn parse_userinfo<'a>(x: &mut &'a str) -> PResult<(&'a str, Option<&'a str>)> {
+            let content = take_until(1.., '@').parse_next(x)?;
+
+            Ok(content
+                .split_once(':')
+                .map(|(username, password)| (username, Some(password)))
+                .unwrap_or((content, None)))
+        }
+
+        fn parse_port(x: &mut &str) -> PResult<IpAddr> {
+            alt((
+                parse_ipv4.map(IpAddr::V4),
+                delimited('[', parse_ipv6, ']').map(IpAddr::V6),
+                "localhost".map(|_| IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                delimited('(', "::1", ')').map(|_| IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ))
+            .parse_next(x)
+        }
+
+        fn parse_host(x: &mut &str) -> PResult<String> {
+            alt((
+                    repeat(1.., 
+                        any
+                    ),
+                    parse_port.map(|x| x.to_string())
+            )).parse_next(x)
+        }
+
+        let userinfo = opt(parse_userinfo).parse_next(x)?;
+        let _ = opt('@').parse_next(x)?;
+
+        let host = take_until(1.., ':').parse_next(x)?;
+        let _ = opt(':').parse_next(x)?;
+
+
+        todo!()
+    }
 }
 
 #[derive(Debug)]
@@ -30,7 +107,9 @@ struct Url {
 
 fn parse_url(url: &mut &str) -> PResult<Url> {
     seq! { Url {
-        scheme: opt(parse_scheme.map(str::to_string)),
+        scheme: opt(alpha1.map(str::to_string)),
+        _: literal(":"),
+        _: opt(literal("//")),
     }}
     .parse_next(url)
 }
@@ -43,7 +122,37 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use crate::parse_url;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use winnow::error::{ContextError, ParseError};
+
+    use crate::*;
+
+    #[test]
+    fn ipv4() {
+        fn parse(x: &str) -> Ipv4Addr {
+            authority::parse_ipv4.parse(x).unwrap()
+        }
+
+        assert_eq!(parse("192.168.0.1"), Ipv4Addr::new(192, 168, 0, 1));
+        assert_eq!(parse("255.255.255.255"), Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(parse("0.0.0.0"), Ipv4Addr::new(0, 0, 0, 0));
+        assert!(authority::parse_ipv4.parse("meow").is_err());
+    }
+
+    #[test]
+    fn ipv6() {
+        fn parse(x: &str) -> Result<Ipv6Addr, ParseError<&str, ContextError>> {
+            authority::parse_ipv6.parse(x)
+        }
+
+        assert_eq!(
+            parse("2001:0db8:85a3:0000:0000:8a2e:0370:7334"),
+            Ok(Ipv6Addr::new(
+                0x2001, 0x0db8, 0x85a3, 0x0000, 0x0000, 0x8a2e, 0x0370, 0x7334
+            ))
+        );
+        assert!(parse("error").is_err())
+    }
 
     #[test]
     fn parsing_test() {
